@@ -27,6 +27,8 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 
 #define MAX_RIFF_CHUNKS 16
 
+#define PIPE_COMMAND_DEFAULT "ffmpeg -f avi -i - -threads 0 -preset ultrafast -y -pix_fmt yuv444p -crf 23 %o.mp4 2> ffmpeglog.txt"
+
 typedef struct audioFormat_s
 {
   int rate;
@@ -46,9 +48,6 @@ typedef struct aviFileData_s
   int           fileSize;
   int           moviOffset;
   int           moviSize;
-
-  fileHandle_t  idxF;
-  int           numIndices;
 
   int           frameRate;
   int           framePeriod;
@@ -81,7 +80,7 @@ SafeFS_Write
 */
 static ID_INLINE void SafeFS_Write( const void *buffer, int len, fileHandle_t f )
 {
-  if( FS_Write( buffer, len, f ) < len )
+  if( FS_PipeWrite( buffer, len, f ) < len )
     Com_Error( ERR_DROP, "Failed to write avi file" );
 }
 
@@ -313,6 +312,55 @@ void CL_WriteAVIHeader( void )
   }
 }
 
+
+static qhandle_t aviPipeOpen(const char *name) {
+    const char *format;
+    qboolean haveTag = qfalse;
+    char outBuf[2048];
+    int	outIndex = 0;
+    int outLeft = sizeof(outBuf) - 1;
+    fileHandle_t f = 0;
+    cvar_t *video_pipeCommand;
+
+    video_pipeCommand = Cvar_Get ("video_pipeCommand", PIPE_COMMAND_DEFAULT, CVAR_ARCHIVE);
+
+    format = video_pipeCommand->string;
+    if (!format || !format[0]) {
+        format = PIPE_COMMAND_DEFAULT;
+    }
+
+    while (*format && outLeft  > 0) {
+        if (haveTag) {
+            char ch = *format++;
+            haveTag = qfalse;
+            switch (ch) {
+                case 'o':    //output
+                    Com_sprintf( outBuf + outIndex, outLeft, "%s", name);
+                    outIndex += strlen( outBuf + outIndex );
+                    break;
+                case '%':
+                    outBuf[outIndex++] = '%';
+                    break;
+                default:
+                    continue;
+            }
+            outLeft = sizeof(outBuf) - outIndex - 1;
+            continue;
+        }
+        if (*format == '%') {
+            haveTag = qtrue;
+            format++;
+            continue;
+        }
+        outBuf[outIndex++] = *format++;
+        outLeft = sizeof(outBuf) - outIndex - 1;
+    }
+    outBuf[ outIndex ] = 0;
+    f = FS_PipeOpen(outBuf, name, "wb");
+
+    return f;
+}
+
 /*
 ===============
 CL_OpenAVIForWriting
@@ -335,14 +383,10 @@ qboolean CL_OpenAVIForWriting( const char *fileName )
     return qfalse;
   }
 
-  if( ( afd.f = FS_FOpenFileWrite( fileName ) ) <= 0 )
-    return qfalse;
-
-  if( ( afd.idxF = FS_FOpenFileWrite(
-          va( "%s" INDEX_FILE_EXTENSION, fileName ) ) ) <= 0 )
+  afd.f = aviPipeOpen(fileName);
+  if (!afd.f)
   {
-    FS_FCloseFile( afd.f );
-    return qfalse;
+    Com_Printf("Failed to open %s for pipe output, trying default avi...\n", fileName);
   }
 
   Q_strncpyz( afd.fileName, fileName, MAX_QPATH );
@@ -411,10 +455,6 @@ qboolean CL_OpenAVIForWriting( const char *fileName )
   SafeFS_Write( buffer, bufIndex, afd.f );
   afd.fileSize = bufIndex;
 
-  bufIndex = 0;
-  START_CHUNK( "idx1" );
-  SafeFS_Write( buffer, bufIndex, afd.idxF );
-
   afd.moviSize = 4; // For the "movi"
   afd.fileOpen = qtrue;
 
@@ -428,27 +468,6 @@ CL_CheckFileSize
 */
 static qboolean CL_CheckFileSize( int bytesToAdd )
 {
-  unsigned int newFileSize;
-
-  newFileSize =
-    afd.fileSize +                // Current file size
-    bytesToAdd +                  // What we want to add
-    ( afd.numIndices * 16 ) +     // The index
-    4;                            // The index size
-
-  // I assume all the operating systems
-  // we target can handle a 2Gb file
-  if( newFileSize > INT_MAX )
-  {
-    // Close the current file...
-    CL_CloseAVI( );
-
-    // ...And open a new one
-    CL_OpenAVIForWriting( va( "%s_", afd.fileName ) );
-
-    return qtrue;
-  }
-
   return qfalse;
 }
 
@@ -459,7 +478,6 @@ CL_WriteAVIVideoFrame
 */
 void CL_WriteAVIVideoFrame( const byte *imageBuffer, int size )
 {
-  int   chunkOffset = afd.fileSize - afd.moviOffset - 8;
   int   chunkSize = 8 + size;
   int   paddingSize = PADLEN(size, 2);
   byte  padding[ 4 ] = { 0 };
@@ -485,16 +503,6 @@ void CL_WriteAVIVideoFrame( const byte *imageBuffer, int size )
 
   if( size > afd.maxRecordSize )
     afd.maxRecordSize = size;
-
-  // Index
-  bufIndex = 0;
-  WRITE_STRING( "00dc" );           //dwIdentifier
-  WRITE_4BYTES( 0x00000010 );       //dwFlags (all frames are KeyFrames)
-  WRITE_4BYTES( chunkOffset );      //dwOffset
-  WRITE_4BYTES( size );             //dwLength
-  SafeFS_Write( buffer, 16, afd.idxF );
-
-  afd.numIndices++;
 }
 
 #define PCM_BUFFER_SIZE 44100
@@ -533,7 +541,6 @@ void CL_WriteAVIAudioFrame( const byte *pcmBuffer, int size )
   if( bytesInBuffer >= (int)ceil( (float)afd.a.rate / (float)afd.frameRate ) *
         afd.a.sampleSize )
   {
-    int   chunkOffset = afd.fileSize - afd.moviOffset - 8;
     int   chunkSize = 8 + bytesInBuffer;
     int   paddingSize = PADLEN(bytesInBuffer, 2);
     byte  padding[ 4 ] = { 0 };
@@ -550,16 +557,6 @@ void CL_WriteAVIAudioFrame( const byte *pcmBuffer, int size )
     afd.numAudioFrames++;
     afd.moviSize += ( chunkSize + paddingSize );
     afd.a.totalBytes += bytesInBuffer;
-
-    // Index
-    bufIndex = 0;
-    WRITE_STRING( "01wb" );           //dwIdentifier
-    WRITE_4BYTES( 0 );                //dwFlags
-    WRITE_4BYTES( chunkOffset );      //dwOffset
-    WRITE_4BYTES( bytesInBuffer );    //dwLength
-    SafeFS_Write( buffer, 16, afd.idxF );
-
-    afd.numIndices++;
 
     bytesInBuffer = 0;
   }
@@ -589,67 +586,19 @@ Closes the AVI file and writes an index chunk
 */
 qboolean CL_CloseAVI( void )
 {
-  int indexRemainder;
-  int indexSize = afd.numIndices * 16;
-  const char *idxFileName = va( "%s" INDEX_FILE_EXTENSION, afd.fileName );
-
-  // AVI file isn't open
+  // Video file isn't open
   if( !afd.fileOpen )
     return qfalse;
 
   afd.fileOpen = qfalse;
-
-  FS_Seek( afd.idxF, 4, FS_SEEK_SET );
-  bufIndex = 0;
-  WRITE_4BYTES( indexSize );
-  SafeFS_Write( buffer, bufIndex, afd.idxF );
-  FS_FCloseFile( afd.idxF );
-
-  // Write index
-
-  // Open the temp index file
-  if( ( indexSize = FS_FOpenFileRead( idxFileName,
-          &afd.idxF, qtrue ) ) <= 0 )
-  {
-    FS_FCloseFile( afd.f );
-    return qfalse;
-  }
-
-  indexRemainder = indexSize;
-
-  // Append index to end of avi file
-  while( indexRemainder > MAX_AVI_BUFFER )
-  {
-    FS_Read( buffer, MAX_AVI_BUFFER, afd.idxF );
-    SafeFS_Write( buffer, MAX_AVI_BUFFER, afd.f );
-    afd.fileSize += MAX_AVI_BUFFER;
-    indexRemainder -= MAX_AVI_BUFFER;
-  }
-  FS_Read( buffer, indexRemainder, afd.idxF );
-  SafeFS_Write( buffer, indexRemainder, afd.f );
-  afd.fileSize += indexRemainder;
-  FS_FCloseFile( afd.idxF );
-
-  // Remove temp index file
-  FS_HomeRemove( idxFileName );
-
-  // Write the real header
-  FS_Seek( afd.f, 0, FS_SEEK_SET );
-  CL_WriteAVIHeader( );
-
-  bufIndex = 4;
-  WRITE_4BYTES( afd.fileSize - 8 ); // "RIFF" size
-
-  bufIndex = afd.moviOffset + 4;    // Skip "LIST"
-  WRITE_4BYTES( afd.moviSize );
-
-  SafeFS_Write( buffer, bufIndex, afd.f );
-
   Z_Free( afd.cBuffer );
   Z_Free( afd.eBuffer );
-  FS_FCloseFile( afd.f );
 
-  Com_Printf( "Wrote %d:%d frames to %s\n", afd.numVideoFrames, afd.numAudioFrames, afd.fileName );
+  if (afd.f)
+  {
+    FS_PipeClose(afd.f);
+    Com_Memset( &afd, 0, sizeof( aviFileData_t ) );
+  }
 
   return qtrue;
 }
